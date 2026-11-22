@@ -1,229 +1,167 @@
-// Tiny stack VM for make.fun ISA v1 (see kit ISA.md).
-// One run answers every instance in /input/<id>/ and writes
-// /output/<id>/stdout.bin + /output/<id>/exit.txt.
-// Runs on Node 22+ (type stripping), no dependencies.
+// Tiny stack VM, make.fun ISA v1. One run answers every /input/<id>/
+// (program.bin + input.bin) and writes /output/<id>/stdout.bin + exit.txt.
+// Node 22+, no dependencies.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-
-const IN_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
-const STACK_CAP = 256;
-const CALL_CAP = 64;
-const MEM_WORDS = 256;
-const STEP_CAP = 1_000_000;
-const OUT_CAP = 65_536;
-
-// Trap exit codes, ISA.md "Traps".
-const T_UNDERFLOW = 2;
-const T_OVERFLOW = 3;
-const T_DIVZERO = 4;
-const T_BADOP = 5;
-const T_MEM = 6;
-const T_CALLDEPTH = 7;
-const T_RETEMPTY = 8;
-const T_PC = 9;
-const T_STEPS = 10;
-const T_OUTPUT = 11;
-
-// Opcode bytes (ISA.md table).
-const OP = {
-  HALT: 0x00, PUSH8: 0x01, PUSH32: 0x02, POP: 0x03, DUP: 0x04,
-  SWAP: 0x05, OVER: 0x06, ROT: 0x07,
-  ADD: 0x10, SUB: 0x11, MUL: 0x12, DIV: 0x13, MOD: 0x14,
-  DIVU: 0x15, MODU: 0x16, NEG: 0x17, AND: 0x18, OR: 0x19,
-  XOR: 0x1a, NOT: 0x1b, SHL: 0x1c, SHR: 0x1d, SHRU: 0x1e,
-  EQ: 0x20, LT: 0x21, LTU: 0x22,
-  JMP: 0x30, JZ: 0x31, JNZ: 0x32, CALL: 0x33, RET: 0x34,
-  LOAD: 0x40, STORE: 0x41,
-  PRINT: 0x50, PUTC: 0x51, IN: 0x52, EXIT: 0x53,
-} as const;
-
-// Immediate length in bytes for each opcode (0 for most).
-function immLen(op: number): number {
-  if (op === OP.PUSH8) return 1;
-  if (op === OP.PUSH32) return 4;
-  if (op === OP.JMP || op === OP.JZ || op === OP.JNZ || op === OP.CALL) return 2;
-  return 0;
+const IN = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const OUT = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+// Traps: 2 underflow, 3 overflow, 4 div by zero, 5 bad opcode, 6 memory,
+// 7 call depth, 8 empty RET, 9 pc, 10 step limit, 11 output limit.
+const O = {
+  HALT: 0, PUSH8: 1, PUSH32: 2, POP: 3, DUP: 4, SWAP: 5, OVER: 6, ROT: 7,
+  ADD: 16, SUB: 17, MUL: 18, DIV: 19, MOD: 20, DIVU: 21, MODU: 22,
+  NEG: 23, AND: 24, OR: 25, XOR: 26, NOT: 27, SHL: 28, SHR: 29, SHRU: 30,
+  EQ: 32, LT: 33, LTU: 34,
+  JMP: 48, JZ: 49, JNZ: 50, CALL: 51, RET: 52,
+  LOAD: 64, STORE: 65, PRINT: 80, PUTC: 81, IN: 82, EXIT: 83,
+};
+// Immediate length in bytes.
+const imm = (op: number) =>
+  op === 1 ? 1 : op === 2 ? 4 : op >= 48 && op <= 51 ? 2 : 0;
+// True for the 37 opcode bytes.
+const valid = (op: number) =>
+  op <= 7 || (op >= 16 && op <= 30) || (op >= 32 && op <= 34) ||
+  (op >= 48 && op <= 52) || op === 64 || op === 65 || (op >= 80 && op <= 83);
+// True for the 15 two-operand opcodes (a b -- r).
+const binop = (op: number) =>
+  (op >= 16 && op <= 22) || (op >= 24 && op <= 26) ||
+  (op >= 28 && op <= 30) || (op >= 32 && op <= 34);
+// [pops, pushes] for the stack checks.
+function effect(op: number): [number, number] {
+  if (op === 1 || op === 2 || op === 82) return [0, 1]; // PUSH8, PUSH32, IN
+  if (op === 7) return [3, 3]; // ROT
+  if (op === 6) return [2, 3]; // OVER
+  if (op === 4) return [1, 2]; // DUP
+  if (op === 5) return [2, 2]; // SWAP
+  if (op === 65) return [2, 0]; // STORE
+  if (op === 64) return [1, 1]; // LOAD
+  if (binop(op)) return [2, 1];
+  if (op === 3 || op === 23 || op === 27 || op === 49 || op === 50 ||
+      op === 80 || op === 81 || op === 83) return [1, 0];
+  return [0, 0]; // HALT, JMP, CALL, RET
 }
 
-// How many values an opcode pops and pushes, for the stack checks.
-function stackEffect(op: number): [number, number] {
-  switch (op) {
-    case OP.PUSH8: case OP.PUSH32: case OP.IN: return [0, 1];
-    case OP.POP: case OP.NEG: case OP.NOT: case OP.PRINT:
-    case OP.PUTC: case OP.EXIT: case OP.JZ: case OP.JNZ: return [1, 0];
-    case OP.DUP: return [1, 2];
-    case OP.SWAP: case OP.STORE: return [2, 0];
-    case OP.OVER: return [2, 3];
-    case OP.ROT: return [3, 3];
-    case OP.LOAD: return [1, 1];
-    case OP.ADD: case OP.SUB: case OP.MUL: case OP.DIV: case OP.MOD:
-    case OP.DIVU: case OP.MODU: case OP.AND: case OP.OR: case OP.XOR:
-    case OP.SHL: case OP.SHR: case OP.SHRU: case OP.EQ: case OP.LT:
-    case OP.LTU: return [2, 1];
-    default: return [0, 0]; // HALT, JMP, CALL, RET
-  }
-}
-
-function isOpcode(op: number): boolean {
-  if (op <= 0x07) return true;
-  if (op >= 0x10 && op <= 0x1e && op !== 0x1f) return true;
-  if (op >= 0x20 && op <= 0x22) return true;
-  if (op >= 0x30 && op <= 0x34) return true;
-  if (op === 0x40 || op === 0x41) return true;
-  if (op >= 0x50 && op <= 0x53) return true;
-  return false;
-}
-
-// Runs one program on one input. Returns [stdout bytes, exit code].
 function run(prog: Uint8Array, input: Uint8Array): [Uint8Array, number] {
-  const stack = new Int32Array(STACK_CAP);
-  let sp = 0;
-  const calls = new Int32Array(CALL_CAP);
-  let cp = 0;
-  const mem = new Int32Array(MEM_WORDS);
-  const out = new Uint8Array(OUT_CAP);
-  let outLen = 0;
-  let inPos = 0;
-  let pc = 0;
-  let steps = 0;
-  const end = prog.length;
-  const finish = (code: number): [Uint8Array, number] => [out.slice(0, outLen), code];
+  const S = new Int32Array(256); let sp = 0;
+  const C = new Int32Array(64); let cp = 0;
+  const M = new Int32Array(256);
+  const out = new Uint8Array(65536); let len = 0;
+  let ipos = 0, pc = 0, steps = 0;
+  const n = prog.length;
+  const done = (code: number): [Uint8Array, number] => [out.slice(0, len), code];
 
   for (;;) {
-    // Trap order (ISA.md "One step"): step limit, pc range, bad opcode,
-    // cut-off immediate, then stack checks, then the instruction's own traps.
-    if (steps === STEP_CAP) return finish(T_STEPS);
-    if (pc < 0 || pc >= end) return finish(T_PC);
+    // Trap order: step limit, pc range, bad opcode, cut-off immediate,
+    // then stack checks, then the instruction's own traps.
+    if (steps === 1000000) return done(10);
+    if (pc < 0 || pc >= n) return done(9);
     const op = prog[pc];
-    if (!isOpcode(op)) return finish(T_BADOP);
-    const imm = immLen(op);
-    if (pc + imm >= end) return finish(T_PC);
+    if (!valid(op)) return done(5);
+    const im = imm(op);
+    if (pc + im >= n) return done(9);
     steps++;
-    const next = pc + 1 + imm;
-    const [pops, pushes] = stackEffect(op);
-    if (sp < pops) return finish(T_UNDERFLOW);
-    if (sp - pops + pushes > STACK_CAP) return finish(T_OVERFLOW);
+    const next = pc + 1 + im;
+    const [pops, pushes] = effect(op);
+    if (sp < pops) return done(2);
+    if (sp - pops + pushes > 256) return done(3);
     pc = next;
 
-    if (op === OP.HALT) return finish(0);
-
-    if (op === OP.PUSH8) {
-      // Sign-extend the byte: 0xFF is -1.
-      stack[sp++] = (prog[next - 1] << 24) >> 24;
-    } else if (op === OP.PUSH32) {
-      stack[sp++] =
-        prog[next - 4] |
-        (prog[next - 3] << 8) |
-        (prog[next - 2] << 16) |
-        (prog[next - 1] << 24);
-    } else if (op === OP.POP) {
-      sp--;
-    } else if (op === OP.DUP) {
-      stack[sp] = stack[sp - 1];
-      sp++;
-    } else if (op === OP.SWAP) {
-      const tmp = stack[sp - 1];
-      stack[sp - 1] = stack[sp - 2];
-      stack[sp - 2] = tmp;
-    } else if (op === OP.OVER) {
-      stack[sp] = stack[sp - 2];
-      sp++;
-    } else if (op === OP.ROT) {
-      const a = stack[sp - 3];
-      stack[sp - 3] = stack[sp - 2];
-      stack[sp - 2] = stack[sp - 1];
-      stack[sp - 1] = a;
-    } else if (op === OP.NEG) {
-      stack[sp - 1] = -stack[sp - 1] | 0; // wraps: -INT_MIN stays INT_MIN
-    } else if (op === OP.NOT) {
-      stack[sp - 1] = ~stack[sp - 1];
-    } else if (op === OP.JMP || op === OP.JZ || op === OP.JNZ) {
-      const offset = ((prog[next - 2] | (prog[next - 1] << 8)) << 16) >> 16;
-      let take = op === OP.JMP;
-      if (op !== OP.JMP) {
-        const v = stack[--sp];
-        take = op === OP.JZ ? v === 0 : v !== 0;
+    if (op === O.HALT) return done(0);
+    if (op === O.PUSH8) S[sp++] = (prog[next - 1] << 24) >> 24; // sign-extended
+    else if (op === O.PUSH32) {
+      S[sp++] = prog[next - 4] | (prog[next - 3] << 8) |
+        (prog[next - 2] << 16) | (prog[next - 1] << 24);
+    } else if (op === O.POP) sp--;
+    else if (op === O.DUP) { S[sp] = S[sp - 1]; sp++; }
+    else if (op === O.SWAP) {
+      const t = S[sp - 1]; S[sp - 1] = S[sp - 2]; S[sp - 2] = t;
+    } else if (op === O.OVER) { S[sp] = S[sp - 2]; sp++; }
+    else if (op === O.ROT) {
+      const a = S[sp - 3];
+      S[sp - 3] = S[sp - 2]; S[sp - 2] = S[sp - 1]; S[sp - 1] = a;
+    } else if (op === O.NEG) S[sp - 1] = -S[sp - 1] | 0;
+    else if (op === O.NOT) S[sp - 1] = ~S[sp - 1];
+    else if (op === O.JMP || op === O.JZ || op === O.JNZ) {
+      const off = ((prog[next - 2] | (prog[next - 1] << 8)) << 16) >> 16;
+      let take = op === O.JMP;
+      if (op !== O.JMP) {
+        const v = S[--sp];
+        take = op === O.JZ ? v === 0 : v !== 0;
       }
-      if (take) pc = next + offset;
-    } else if (op === OP.CALL) {
-      if (cp === CALL_CAP) return finish(T_CALLDEPTH);
-      calls[cp++] = next;
+      if (take) pc = next + off;
+    } else if (op === O.CALL) {
+      if (cp === 64) return done(7);
+      C[cp++] = next;
       pc = prog[next - 2] | (prog[next - 1] << 8);
-    } else if (op === OP.RET) {
-      if (cp === 0) return finish(T_RETEMPTY);
-      pc = calls[--cp];
-    } else if (op === OP.LOAD) {
-      const addr = stack[sp - 1];
-      if (addr < 0 || addr >= MEM_WORDS) return finish(T_MEM);
-      stack[sp - 1] = mem[addr];
-    } else if (op === OP.STORE) {
-      const addr = stack[sp - 1];
-      const val = stack[sp - 2];
-      if (addr < 0 || addr >= MEM_WORDS) return finish(T_MEM);
+    } else if (op === O.RET) {
+      if (cp === 0) return done(8);
+      pc = C[--cp];
+    } else if (op === O.LOAD) {
+      const a = S[sp - 1];
+      if (a < 0 || a > 255) return done(6);
+      S[sp - 1] = M[a];
+    } else if (op === O.STORE) {
+      const a = S[sp - 1], v = S[sp - 2];
+      if (a < 0 || a > 255) return done(6);
       sp -= 2;
-      mem[addr] = val;
-    } else if (op === OP.PRINT) {
-      const text = String(stack[sp - 1]);
-      const bytes = Buffer.from(text, 'ascii');
-      if (outLen + bytes.length > OUT_CAP) return finish(T_OUTPUT);
+      M[a] = v;
+    } else if (op === O.PRINT) {
+      const b = Buffer.from(String(S[sp - 1]), 'ascii');
+      if (len + b.length > 65536) return done(11);
       sp--;
-      out.set(bytes, outLen);
-      outLen += bytes.length;
-    } else if (op === OP.PUTC) {
-      if (outLen + 1 > OUT_CAP) return finish(T_OUTPUT);
-      out[outLen++] = stack[--sp] & 255;
-    } else if (op === OP.IN) {
-      stack[sp++] = inPos < input.length ? input[inPos++] : -1;
-    } else if (op === OP.EXIT) {
-      return finish(stack[--sp] & 255);
+      out.set(b, len);
+      len += b.length;
+    } else if (op === O.PUTC) {
+      if (len + 1 > 65536) return done(11);
+      out[len++] = S[--sp] & 255;
+    } else if (op === O.IN) {
+      S[sp++] = ipos < input.length ? input[ipos++] : -1;
+    } else if (op === O.EXIT) {
+      return done(S[--sp] & 255);
     } else {
-      // Binary ops: ( a b -- r ), b is the top of the stack.
-      const b = stack[sp - 1];
-      const a = stack[sp - 2];
+      // Binary ops: ( a b -- r ), b on top.
+      const b = S[sp - 1], a = S[sp - 2];
       let r: number;
-      if (op === OP.ADD) r = (a + b) | 0;
-      else if (op === OP.SUB) r = (a - b) | 0;
-      else if (op === OP.MUL) r = Math.imul(a, b); // low 32 bits
-      else if (op === OP.DIV) {
-        if (b === 0) return finish(T_DIVZERO);
+      if (op === O.ADD) r = (a + b) | 0;
+      else if (op === O.SUB) r = (a - b) | 0;
+      else if (op === O.MUL) r = Math.imul(a, b);
+      else if (op === O.DIV) {
+        if (b === 0) return done(4);
         r = a === -2147483648 && b === -1 ? a : (a / b) | 0;
-      } else if (op === OP.MOD) {
-        if (b === 0) return finish(T_DIVZERO);
-        r = b === -1 ? 0 : (a % b) | 0; // remainder takes the sign of a
-      } else if (op === OP.DIVU) {
-        if (b === 0) return finish(T_DIVZERO);
+      } else if (op === O.MOD) {
+        if (b === 0) return done(4);
+        r = b === -1 ? 0 : (a % b) | 0;
+      } else if (op === O.DIVU) {
+        if (b === 0) return done(4);
         r = Math.floor((a >>> 0) / (b >>> 0)) | 0;
-      } else if (op === OP.MODU) {
-        if (b === 0) return finish(T_DIVZERO);
+      } else if (op === O.MODU) {
+        if (b === 0) return done(4);
         r = ((a >>> 0) % (b >>> 0)) | 0;
-      } else if (op === OP.AND) r = a & b;
-      else if (op === OP.OR) r = a | b;
-      else if (op === OP.XOR) r = a ^ b;
-      else if (op === OP.SHL) r = a << (b & 31);
-      else if (op === OP.SHR) r = a >> (b & 31); // arithmetic
-      else if (op === OP.SHRU) r = (a >>> (b & 31)) | 0; // logical
-      else if (op === OP.EQ) r = a === b ? 1 : 0;
-      else if (op === OP.LT) r = a < b ? 1 : 0;
+      } else if (op === O.AND) r = a & b;
+      else if (op === O.OR) r = a | b;
+      else if (op === O.XOR) r = a ^ b;
+      else if (op === O.SHL) r = a << (b & 31);
+      else if (op === O.SHR) r = a >> (b & 31);
+      else if (op === O.SHRU) r = (a >>> (b & 31)) | 0;
+      else if (op === O.EQ) r = a === b ? 1 : 0;
+      else if (op === O.LT) r = a < b ? 1 : 0;
       else r = (a >>> 0) < (b >>> 0) ? 1 : 0; // LTU
       sp -= 2;
-      stack[sp++] = r;
+      S[sp++] = r;
     }
   }
 }
 
-
-// Driver: answer every instance in IN_DIR, one per subdirectory.
-for (const entry of readdirSync(IN_DIR, { withFileTypes: true })) {
-  if (!entry.isDirectory()) continue;
-  const id = entry.name;
-  const dir = join(IN_DIR, id);
-  const program = readFileSync(join(dir, 'program.bin'));
-  const input = readFileSync(join(dir, 'input.bin'));
-  const [stdout, exitCode] = run(program, input);
-  const outDir = join(OUT_DIR, id);
-  mkdirSync(outDir, { recursive: true });
-  writeFileSync(join(outDir, 'stdout.bin'), stdout);
-  writeFileSync(join(outDir, 'exit.txt'), exitCode + '\n');
+// Driver: answer every instance in IN, one per subdirectory.
+for (const e of readdirSync(IN, { withFileTypes: true })) {
+  if (!e.isDirectory()) continue;
+  const dir = join(IN, e.name);
+  const [stdout, exit] = run(
+    readFileSync(join(dir, 'program.bin')),
+    readFileSync(join(dir, 'input.bin')),
+  );
+  const od = join(OUT, e.name);
+  mkdirSync(od, { recursive: true });
+  writeFileSync(join(od, 'stdout.bin'), stdout);
+  writeFileSync(join(od, 'exit.txt'), exit + '\n');
 }
